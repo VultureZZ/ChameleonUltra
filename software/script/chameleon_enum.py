@@ -527,6 +527,7 @@ class ButtonPressFunction(enum.IntEnum):
     PREVSLOT = 2
     CLONE = 3
     BATTERY = 4
+    CONTINUOUS_READ = 5
 
     def __str__(self):
         if self == ButtonPressFunction.NONE:
@@ -539,6 +540,8 @@ class ButtonPressFunction(enum.IntEnum):
             return "Read then simulate the ID/UID card number"
         elif self == ButtonPressFunction.BATTERY:
             return "Show Battery Level"
+        elif self == ButtonPressFunction.CONTINUOUS_READ:
+            return "Continuous card reading (HF and LF)"
         return "None"
 
 

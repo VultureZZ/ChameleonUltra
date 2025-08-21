@@ -40,6 +40,8 @@ NRF_LOG_MODULE_REGISTER();
 #include "rgb_marquee.h"
 #include "tag_persistence.h"
 #include "settings.h"
+#include "lf_reader_main.h"
+#include "lf_tag_em.h"
 
 // Defining soft timers
 APP_TIMER_DEF(m_button_check_timer); // Timer for button debounce
@@ -555,6 +557,320 @@ static void show_battery(void) {
     // nothing special to finish, we wait for sleep or slot change
 }
 
+/**
+ * @brief Continuous card reading function
+ * LED sequence: RED -> GREEN -> start reading
+ * Continuously scans HF and LF until a card is detected, then saves it
+ */
+static void continuous_rf_read(void) {
+    // LED sequence: RED -> GREEN
+    set_slot_light_color(RGB_RED);
+    light_up_by_slot();
+    bsp_delay_ms(500);
+    set_slot_light_color(RGB_GREEN);
+    light_up_by_slot();
+    bsp_delay_ms(500);
+
+    NRF_LOG_INFO("Starting continuous card reading - Press any button to stop");
+
+    // Enter reader mode first
+    bool was_in_reader_mode = get_device_mode() == DEVICE_MODE_READER;
+    if (!was_in_reader_mode) {
+        reader_mode_enter();
+        bsp_delay_ms(8);
+    }
+
+    // Set shorter timeout for LF scanning to make it more responsive
+    set_scan_tag_timeout(100); // 100ms instead of default 500ms
+
+    // Clear button flags
+    m_is_a_btn_release = false;
+    m_is_b_btn_release = false;
+
+    uint32_t read_count = 0;
+    bool card_found = false;
+
+    while (!card_found) {
+        // Check for button press to stop
+        if (m_is_a_btn_release || m_is_b_btn_release) {
+            NRF_LOG_INFO("Button pressed - stopping scan");
+            break;
+        }
+
+       // Try HF scan (with proper antenna control like btn_fn_copy_hf)
+        pcd_14a_reader_antenna_on();
+        bsp_delay_ms(8);
+        picc_14a_tag_t hf_tag;
+        uint8_t hf_status = pcd_14a_reader_scan_auto(&hf_tag);
+        pcd_14a_reader_antenna_off();
+
+        if (hf_status == STATUS_HF_TAG_OK) {
+            // Log HF card details
+            NRF_LOG_INFO("HF card detected!");
+            NRF_LOG_INFO("  UID Length: %d", hf_tag.uid_len);
+            NRF_LOG_INFO("  UID: %02X%02X%02X%02X%s",
+                        hf_tag.uid[0], hf_tag.uid[1], hf_tag.uid[2], hf_tag.uid[3],
+                        (hf_tag.uid_len > 4) ? "..." : "");
+            NRF_LOG_INFO("  SAK: 0x%02X", hf_tag.sak);
+            NRF_LOG_INFO("  ATQA: 0x%02X%02X", hf_tag.atqa[0], hf_tag.atqa[1]);
+            if (hf_tag.ats_len > 0) {
+                NRF_LOG_INFO("  ATS Length: %d", hf_tag.ats_len);
+            }
+
+            // Determine HF card type and clone to slot 7
+            tag_specific_type_t hf_tag_type = TAG_TYPE_UNDEFINED;
+
+            // Determine card type based on SAK and ATQA
+            if (hf_tag.sak == 0x00 && hf_tag.atqa[0] == 0x00 && hf_tag.atqa[1] == 0x04) {
+                // MIFARE Ultralight/NTAG
+                if (hf_tag.uid_len == 7) {
+                    hf_tag_type = TAG_TYPE_NTAG_213;
+                } else if (hf_tag.uid_len == 4) {
+                    hf_tag_type = TAG_TYPE_MF0UL11;
+                }
+            } else if (hf_tag.sak == 0x08 || hf_tag.sak == 0x88) {
+                // MIFARE Classic
+                hf_tag_type = TAG_TYPE_MIFARE_1024;
+            } else if (hf_tag.sak == 0x09) {
+                // MIFARE Mini
+                hf_tag_type = TAG_TYPE_MIFARE_Mini;
+            } else if (hf_tag.sak == 0x10) {
+                // MIFARE Classic 4K
+                hf_tag_type = TAG_TYPE_MIFARE_4096;
+            } else if (hf_tag.sak == 0x18) {
+                // MIFARE Classic 2K
+                hf_tag_type = TAG_TYPE_MIFARE_2048;
+            }
+
+            if (hf_tag_type != TAG_TYPE_UNDEFINED) {
+                // Clone HF card to slot 7
+                tag_data_buffer_t *buffer = get_buffer_by_tag_type(hf_tag_type);
+                if (buffer != NULL) {
+                    nfc_tag_14a_coll_res_entity_t *antres = NULL;
+
+                    // Set up the appropriate buffer structure based on card type
+                    switch (hf_tag_type) {
+                        case TAG_TYPE_MIFARE_Mini:
+                        case TAG_TYPE_MIFARE_1024:
+                        case TAG_TYPE_MIFARE_2048:
+                        case TAG_TYPE_MIFARE_4096: {
+                            nfc_tag_mf1_information_t *p_info = (nfc_tag_mf1_information_t *)buffer->buffer;
+                            antres = &(p_info->res_coll);
+                            break;
+                        }
+                        case TAG_TYPE_NTAG_210:
+                        case TAG_TYPE_NTAG_212:
+                        case TAG_TYPE_NTAG_213:
+                        case TAG_TYPE_NTAG_215:
+                        case TAG_TYPE_NTAG_216:
+                        case TAG_TYPE_MF0ICU1:
+                        case TAG_TYPE_MF0ICU2:
+                        case TAG_TYPE_MF0UL11:
+                        case TAG_TYPE_MF0UL21: {
+                            nfc_tag_mf0_ntag_information_t *p_info = (nfc_tag_mf0_ntag_information_t *)buffer->buffer;
+                            antres = &(p_info->res_coll);
+                            break;
+                        }
+                        default:
+                            NRF_LOG_ERROR("Unsupported HF tag type for cloning");
+                            break;
+                    }
+
+                    if (antres != NULL) {
+                        // Copy UID
+                        antres->size = hf_tag.uid_len;
+                        memcpy(antres->uid, hf_tag.uid, hf_tag.uid_len);
+                        // Copy ATQA
+                        memcpy(antres->atqa, hf_tag.atqa, 2);
+                        // Copy SAK
+                        antres->sak[0] = hf_tag.sak;
+                        // Copy ATS
+                        antres->ats.length = hf_tag.ats_len;
+                        memcpy(antres->ats.data, hf_tag.ats, hf_tag.ats_len);
+
+                        // Set the slot type and enable it
+                        tag_emulation_change_type(7, hf_tag_type);
+                        tag_emulation_slot_set_enable(7, TAG_SENSE_HF, true);
+
+                        // Load the tag data for emulation
+                        tag_emulation_load_by_buffer(hf_tag_type, false);
+
+                        // Save nickname to flash
+                        char *nick = "cloned";
+                        uint8_t nick_buffer[36];
+                        nick_buffer[0] = strlen(nick);
+                        memcpy(nick_buffer + 1, nick, nick_buffer[0]);
+
+                        fds_slot_record_map_t map_info;
+                        get_fds_map_by_slot_sense_type_for_nick(7, TAG_SENSE_HF, &map_info);
+                        fds_write_sync(map_info.id, map_info.key, sizeof(nick_buffer), nick_buffer);
+
+                        NRF_LOG_INFO("HF card (type %d) cloned to slot 7 successfully!", hf_tag_type);
+                        NRF_LOG_INFO("  Card type determined: %d", hf_tag_type);
+                    }
+                }
+            } else {
+                NRF_LOG_INFO("Unknown HF card type (SAK: 0x%02X, ATQA: 0x%02X%02X)",
+                            hf_tag.sak, hf_tag.atqa[0], hf_tag.atqa[1]);
+            }
+
+            // Change LED to BLUE and keep it on
+            set_slot_light_color(RGB_BLUE);
+            light_up_by_slot();
+            card_found = true;
+            break;
+        }
+
+        // Try LF scan - EM410X first
+        uint8_t lf_uid[16];
+        uint8_t lf_status = scan_em410x(lf_uid);
+
+        if (lf_status == STATUS_LF_TAG_OK) {
+            // Validate and log EM410X card data
+            uint16_t tag_type = (lf_uid[0] << 8) | lf_uid[1];
+            uint8_t *uid_data = lf_uid + 2; // skip tag type bytes
+
+            NRF_LOG_INFO("LF EM410X card detected!");
+            NRF_LOG_INFO("  Tag Type: 0x%04X", tag_type);
+            NRF_LOG_INFO("  UID: %02X%02X%02X%02X%02X",
+                        uid_data[0], uid_data[1], uid_data[2], uid_data[3], uid_data[4]);
+            NRF_LOG_INFO("Cloning to slot 7...");
+
+            // Clone EM410X card to slot 7
+            tag_data_buffer_t *buffer = get_buffer_by_tag_type(TAG_TYPE_EM410X);
+            if (buffer != NULL) {
+                // Set the slot type and enable it
+                tag_emulation_change_type(7, TAG_TYPE_EM410X);
+                tag_emulation_slot_set_enable(7, TAG_SENSE_LF, true);
+
+                // Copy validated UID data
+                memcpy(buffer->buffer, uid_data, LF_EM410X_TAG_ID_SIZE);
+                tag_emulation_load_by_buffer(TAG_TYPE_EM410X, false);
+
+                // Save nickname to flash
+                char *nick = "cloned";
+                uint8_t nick_buffer[36];
+                nick_buffer[0] = strlen(nick);
+                memcpy(nick_buffer + 1, nick, nick_buffer[0]);
+
+                fds_slot_record_map_t map_info;
+                get_fds_map_by_slot_sense_type_for_nick(7, TAG_SENSE_LF, &map_info);
+                fds_write_sync(map_info.id, map_info.key, sizeof(nick_buffer), nick_buffer);
+
+                NRF_LOG_INFO("EM410X card cloned to slot 7 successfully!");
+            }
+
+            // Change LED to BLUE and keep it on
+            set_slot_light_color(RGB_BLUE);
+            light_up_by_slot();
+            card_found = true;
+            break;
+        }
+
+        // Try LF scan - HID Prox (format 0 = auto-detect)
+        uint8_t hidprox_data[16];
+        uint8_t hidprox_status = scan_hidprox(hidprox_data, 0);
+
+        if (hidprox_status == STATUS_LF_TAG_OK) {
+            // Validate and log HID Prox card data
+            uint8_t format = hidprox_data[0];
+            uint32_t facility_code = (hidprox_data[1] << 24) | (hidprox_data[2] << 16) |
+                                   (hidprox_data[3] << 8) | hidprox_data[4];
+            uint32_t card_number = 0;
+            for (int i = 0; i < 4; i++) {  // Use only 4 bytes for 32-bit number
+                card_number = (card_number << 8) | hidprox_data[5 + i];
+            }
+            uint8_t issue_level = hidprox_data[10];
+            uint16_t oem = (hidprox_data[11] << 8) | hidprox_data[12];
+
+            NRF_LOG_INFO("LF HID Prox card detected!");
+            NRF_LOG_INFO("  Format: %d", format);
+            NRF_LOG_INFO("  Facility Code: %d", (int)facility_code);
+            NRF_LOG_INFO("  Card Number: %d", (int)card_number);
+            if (issue_level > 0) NRF_LOG_INFO("  Issue Level: %d", issue_level);
+            if (oem > 0) NRF_LOG_INFO("  OEM: %d", oem);
+            NRF_LOG_INFO("Cloning to slot 7...");
+
+            // Clone HID Prox card to slot 7
+            tag_data_buffer_t *buffer = get_buffer_by_tag_type(TAG_TYPE_HID_PROX);
+            if (buffer != NULL) {
+                // Set the slot type and enable it
+                tag_emulation_change_type(7, TAG_TYPE_HID_PROX);
+                tag_emulation_slot_set_enable(7, TAG_SENSE_LF, true);
+
+                memcpy(buffer->buffer, hidprox_data, LF_HIDPROX_TAG_ID_SIZE);
+                tag_emulation_load_by_buffer(TAG_TYPE_HID_PROX, false);
+
+                // Save nickname to flash
+                char *nick = "cloned";
+                uint8_t nick_buffer[36];
+                nick_buffer[0] = strlen(nick);
+                memcpy(nick_buffer + 1, nick, nick_buffer[0]);
+
+                fds_slot_record_map_t map_info;
+                get_fds_map_by_slot_sense_type_for_nick(7, TAG_SENSE_LF, &map_info);
+                fds_write_sync(map_info.id, map_info.key, sizeof(nick_buffer), nick_buffer);
+
+                NRF_LOG_INFO("HID Prox card cloned to slot 7 successfully!");
+            }
+
+            // Change LED to BLUE and keep it on
+            set_slot_light_color(RGB_BLUE);
+            light_up_by_slot();
+            card_found = true;
+            break;
+        }
+
+        // Debug: Log LF scan results occasionally
+        if (read_count % 30 == 0 && read_count > 0) {
+            NRF_LOG_INFO("LF scan status - EM410X: %d, HID Prox: %d (0=found, 1=not found)", lf_status, hidprox_status);
+        }
+
+                // Heartbeat every 10 scans (more frequent for debugging)
+        if (read_count % 10 == 0) {
+            NRF_LOG_INFO("Scanning... attempt %d (HF status: %d, LF status: %d)",
+                        read_count, hf_status, lf_status);
+            set_slot_light_color(RGB_YELLOW);
+            light_up_by_slot();
+            bsp_delay_ms(50);
+            set_slot_light_color(RGB_GREEN);
+            light_up_by_slot();
+        }
+
+                // Debug: Log first scan to confirm setup
+        if (read_count == 0) {
+            NRF_LOG_INFO("First scan - Reader mode: %s",
+                        (get_device_mode() == DEVICE_MODE_READER) ? "YES" : "NO");
+        }
+
+        // Debug: Log LF radio status every 20 scans
+        if (read_count % 20 == 0 && read_count > 0) {
+            NRF_LOG_INFO("LF radio status check - scan attempt %d", read_count);
+        }
+
+        read_count++;
+        bsp_delay_ms(200); // Increased delay for better scanning
+
+        // Feed watchdog
+        bsp_wdt_feed();
+        while (NRF_LOG_PROCESS());
+    }
+
+    // Exit reader mode if we weren't in it initially
+    if (!was_in_reader_mode) {
+        tag_mode_enter();
+    }
+
+    // Show completion
+    set_slot_light_color(RGB_CYAN);
+    light_up_by_slot();
+    bsp_delay_ms(300);
+    set_slot_light_color(RGB_GREEN);
+    light_up_by_slot();
+
+    NRF_LOG_INFO("Continuous reading stopped");
+}
+
 #if defined(PROJECT_CHAMELEON_ULTRA)
 
 static void offline_status_blink_color(uint8_t blink_color) {
@@ -752,10 +1068,14 @@ static void run_button_function_by_settings(settings_button_function_t sbf) {
         case SettingsButtonCloneIcUid:
             btn_fn_copy_ic_uid();
             break;
+        case SettingsButtonContinuousRead:
+            continuous_rf_read();
+            break;
 #endif
 
         case SettingsButtonShowBattery:
             show_battery();
+            break;
 
         default:
             NRF_LOG_ERROR("Unsupported button function")

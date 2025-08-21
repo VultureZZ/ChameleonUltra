@@ -1,4 +1,4 @@
-#!/bin/env bash
+#!/bin/bash
 
 if [[ $BASH_SOURCE = */* ]]; then
   cd -- "${BASH_SOURCE%/*}/" || exit
@@ -40,7 +40,7 @@ rm -rf "objects"
   cd objects
 
   cp ../nrf52_sdk/components/softdevice/${softdevice}/hex/${softdevice}_nrf52_${softdevice_version}_softdevice.hex softdevice.hex
-  
+
   nrfutil nrf5sdk-tools pkg generate \
     --hw-version $hw_version \
     --bootloader  bootloader.hex   --bootloader-version  $bootloader_version  --key-file ../../resource/dfu_key/chameleon.pem \
@@ -48,7 +48,7 @@ rm -rf "objects"
     --softdevice  softdevice.hex \
     --sd-req ${softdevice_id} --sd-id ${softdevice_id} \
     ${device_type}-dfu-full.zip
-	
+
   nrfutil nrf5sdk-tools pkg generate \
     --hw-version $hw_version --key-file ../../resource/dfu_key/chameleon.pem \
     --application application.hex  --application-version $application_version \
